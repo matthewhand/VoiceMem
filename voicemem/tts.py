@@ -1,7 +1,7 @@
 """文本 → 语音。回复层只产出文本（见 ``voicemem/reply.py``），出声是这里、可选的一层。
 
-两个后端，都吐 **24kHz PCM16**：默认 OpenAI api，``TTS_BACKEND=local``（或
-``reply.tts.provider == "local"``）走离线 piper。
+两个后端，都吐 **24kHz PCM16**：默认 OpenAI api（也认 LiteLLM/Kokoro 的 wav），
+``TTS_BACKEND=local``（或 ``reply.tts.provider == "local"``）走离线 piper。
 
 ``speak_stream()`` 是「边生成边合成」：吐满一句就送去合成，不等全文生成完——
 等全文再合成的话，字早打完了音频还没起头（实测 TTS 首帧就要 ~1.2s）。
@@ -17,8 +17,11 @@ import numpy as np
 from voicemem.utils.audio.stream_io import resample
 
 TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "alloy")
+TTS_FORMAT = os.environ.get("OPENAI_TTS_FORMAT", "pcm")  # pcm = OpenAI raw 24k; wav/mp3 for LiteLLM/Kokoro
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "openai")   # openai(api) | local(离线小模型)
 SAMPLE_RATE = 24000
+_PCM_FRAME = SAMPLE_RATE // 10 * 2                     # 100 ms of mono PCM16
 
 # 怎么切给 TTS 的段，决定了多久能出第一声。实测 gpt-4o-mini-tts 的首帧延迟随文本
 # 长度涨：8字 615ms / 25字 902ms / 100字 1318ms——所以**第一段要尽量短**（早出声），
@@ -30,16 +33,27 @@ _FIRST_MAX = 20                     # 一个停顿都没有时，第一段也不
 _SENT_MIN  = 12                     # 后续段的最短长度
 _SENT_MAX  = 60                     # 后续段的兜底：LLM 一口气不换气也得切
 
-_client = None
+_clients: dict = {}
 
 
-def _openai():
-    """client 首次用到时才建，``import voicemem.tts`` 不会因此要求有 key。"""
-    global _client
-    if _client is None:
+def _openai(cfg=None):
+    """client 首次用到时才建，``import voicemem.tts`` 不会因此要求有 key。
+
+    ``reply.tts.config`` 可给 ``base_url`` / ``api_key``，这样 TTS 能打到 LiteLLM
+    而不必把全局 ``OPENAI_BASE_URL`` 绑死在网关上（chat 和 speech 模型名不同）。
+    """
+    cfg = cfg or {}
+    base = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL") or ""
+    key = cfg.get("api_key") or os.environ.get("OPENAI_API_KEY") or "EMPTY"
+    cache_key = (base, key)
+    client = _clients.get(cache_key)
+    if client is None:
         from openai import AsyncOpenAI
-        _client = AsyncOpenAI()
-    return _client
+        kwargs = {"api_key": key}
+        if base:
+            kwargs["base_url"] = base
+        client = _clients[cache_key] = AsyncOpenAI(**kwargs)
+    return client
 
 
 def _tts_cfg(reply):
@@ -71,7 +85,7 @@ async def tts_stream(text, reply=None):
     backend = {"local": _local_tts_stream, "voxcpm": _voxcpm_tts_stream}.get(
         backend_name, _openai_tts_stream)
     tail = b""
-    async for chunk in backend(text, cfg.get("model")):
+    async for chunk in backend(text, cfg):
         buf = tail + chunk
         cut = len(buf) & ~1                         # 向下取到偶数
         tail = buf[cut:]
@@ -81,12 +95,49 @@ async def tts_stream(text, reply=None):
         yield tail + b"\x00"                        # 收尾那半个样本补齐
 
 
-async def _openai_tts_stream(text, model=None):
-    """在线 api：OpenAI TTS（gpt-4o-mini-tts），response_format=pcm 就是 24k PCM16。"""
-    async with _openai().audio.speech.with_streaming_response.create(
-            model=model or TTS_MODEL, voice="alloy", input=text, response_format="pcm") as resp:
-        async for chunk in resp.iter_bytes():
-            yield chunk
+def _cfg_model(cfg, fallback):
+    if isinstance(cfg, dict):
+        return cfg.get("model") or fallback
+    return cfg or fallback
+
+
+def _to_pcm16_24k(data: bytes) -> bytes:
+    """wav/mp3/ogg/flac → 24 kHz mono PCM16. Kokoro via LiteLLM speaks wav @ 24 kHz."""
+    import io
+    import soundfile as sf
+
+    audio, sr = sf.read(io.BytesIO(data), dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if int(sr) != SAMPLE_RATE:
+        audio = resample(audio, src=int(sr), dst=SAMPLE_RATE)
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+
+async def _openai_tts_stream(text, cfg=None):
+    """OpenAI-compatible ``/v1/audio/speech``.
+
+    Native OpenAI: ``response_format=pcm`` is already 24 kHz PCM16 and can stream.
+    LiteLLM/Kokoro/F5: they speak wav/mp3 (and reject ``alloy`` / ``pcm``). Fetch
+    the whole file, decode, yield 100 ms frames so the rest of the pipeline is
+    unchanged.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {"model": cfg}
+    model = _cfg_model(cfg, TTS_MODEL)
+    voice = cfg.get("voice") or TTS_VOICE
+    fmt = (cfg.get("response_format") or TTS_FORMAT or "pcm").lower()
+    client = _openai(cfg)
+    kwargs = dict(model=model, voice=voice, input=text, response_format=fmt)
+    if fmt == "pcm":
+        async with client.audio.speech.with_streaming_response.create(**kwargs) as resp:
+            async for chunk in resp.iter_bytes():
+                yield chunk
+        return
+    resp = await client.audio.speech.create(**kwargs)
+    raw = await resp.aread()
+    pcm = await asyncio.to_thread(_to_pcm16_24k, raw)
+    for i in range(0, len(pcm), _PCM_FRAME):
+        yield pcm[i:i + _PCM_FRAME]
 
 
 @lru_cache(maxsize=1)
@@ -98,9 +149,9 @@ def _piper_voice():
     return PiperVoice.load(os.environ["VOICEMEM_TTS_MODEL"])
 
 
-async def _local_tts_stream(text, model=None):
+async def _local_tts_stream(text, cfg=None):
     """离线本地 TTS：合成 → 重采样到 24k → 分块 yield，接口和在线版完全一致。
-    （离线 voice 由 VOICEMEM_TTS_MODEL 指定；model 形参仅为和在线版对齐签名。）"""
+    （离线 voice 由 VOICEMEM_TTS_MODEL 指定；cfg 仅为和在线版对齐签名。）"""
     v = _piper_voice()
     sr = getattr(getattr(v, "config", None), "sample_rate", 22050)
     for raw in v.synthesize_stream_raw(text):          # 同步生成器，int16 bytes @ sr
@@ -118,7 +169,7 @@ def _voxcpm_model():
         os.environ.get("VOICEMEM_TTS_MODEL") or "openbmb/VoxCPM2", load_denoiser=False)
 
 
-async def _voxcpm_tts_stream(text, model=None):
+async def _voxcpm_tts_stream(text, cfg=None):
     """和 _local_tts_stream 同形：合成 → 重采样到 24k → 分块 yield。"""
     m = _voxcpm_model()
     sr = m.tts_model.sample_rate

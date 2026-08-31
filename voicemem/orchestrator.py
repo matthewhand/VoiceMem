@@ -587,9 +587,11 @@ class Orchestrator:
             client = OpenAI(
                 api_key=os.environ.get("OPENAI_API_KEY"),
                 base_url=self._base_url,
-                timeout=15.0,
+                timeout=90.0,
             )
-            resp = client.chat.completions.create(
+            from voicemem.utils.common.openai_compat import chat_complete, message_text
+            resp = chat_complete(
+                client,
                 model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -598,7 +600,7 @@ class Orchestrator:
             )
             from voicemem.utils.common.cost_log import log_usage
             log_usage("llm_json", resp.model, getattr(resp, "usage", None))
-            return (resp.choices[0].message.content or "").strip()
+            return message_text(resp)
         except Exception as e:
             print(f"[SplitMgr] LLM 失败: {e}")
             return ""

@@ -329,7 +329,9 @@ class OpenAIMem0V3AdditiveExtractor:
         else:
             _MERGED_UTTERANCE.pop("text", None)
 
-        resp = client.chat.completions.create(
+        from voicemem.utils.common.openai_compat import chat_complete, message_text
+        resp = chat_complete(
+            client,
             model=self._cfg.resolved_model(),
             messages=[
                 {"role": "system", "content": system},
@@ -339,7 +341,7 @@ class OpenAIMem0V3AdditiveExtractor:
             temperature=0,
         )
         _log_usage("extract", self._cfg.resolved_model(), getattr(resp, "usage", None))
-        raw_text = (resp.choices[0].message.content or "").strip()
+        raw_text = message_text(resp)
         json_str = extract_json(remove_code_blocks(raw_text))
         return parse_additive_memory_response(json_str)
 
@@ -582,13 +584,15 @@ class ConflictResolver:
             '{"memory": []} is a normal and correct answer.'
           )
 
-        resp = client.chat.completions.create(
+        from voicemem.utils.common.openai_compat import chat_complete, message_text
+        resp = chat_complete(
+            client,
             model=self._cfg.resolved_model(),
             messages=[{"role": "user", "content": user_content}],
             response_format={"type": "json_object"},
             temperature=0,
         )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = message_text(resp)
 
         try:
             data = json.loads(remove_code_blocks(raw))

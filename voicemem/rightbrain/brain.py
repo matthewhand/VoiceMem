@@ -862,8 +862,10 @@ significant 不管真假，其余字段都要照填（调用方另有判定）�
                 base_url=self._base_url,
                 timeout=60.0,
             )
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+            from voicemem.utils.common.openai_compat import chat_complete, message_text
+            resp = chat_complete(
+                client,
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=[
                     {"role": "system", "content": (
                         "你是记忆清洁助手。分析以下情感记忆列表，做两类判断。\n"
@@ -883,7 +885,7 @@ significant 不管真假，其余字段都要照填（调用方另有判定）�
                 temperature=0,
             )
 
-            result      = _json.loads(resp.choices[0].message.content)
+            result      = _json.loads(message_text(resp) or "{}")
             short_ids   = result.get("delete_ids", [])
             full_ids    = [id_map[s] for s in short_ids if s in id_map]
 

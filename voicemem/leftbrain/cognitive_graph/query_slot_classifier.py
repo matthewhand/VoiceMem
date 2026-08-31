@@ -132,7 +132,9 @@ class QuerySlotClassifier:
             known.update(name for name, _ in extra_slots)
         system_prompt = _build_system_prompt(extra_slots)
         try:
-            resp = self._client.chat.completions.create(
+            from voicemem.utils.common.openai_compat import chat_complete, message_text
+            resp = chat_complete(
+                self._client,
                 model=self._model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -142,7 +144,7 @@ class QuerySlotClassifier:
                 max_tokens=512,
                 temperature=0,
             )
-            raw = (resp.choices[0].message.content or "").strip()
+            raw = message_text(resp)
             data = json.loads(raw)
             slots = [s for s in (data.get("slots") or []) if s in known]
             entities = [
@@ -179,14 +181,16 @@ class QuerySlotClassifier:
             '只输出 JSON：{"child": "子话题名"} 或 {"child": null}'
         )
         try:
-            resp = self._client.chat.completions.create(
+            from voicemem.utils.common.openai_compat import chat_complete, message_text
+            resp = chat_complete(
+                self._client,
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 max_tokens=256,
                 temperature=0,
             )
-            raw = (resp.choices[0].message.content or "").strip()
+            raw = message_text(resp)
             data = json.loads(raw)
             child = data.get("child")
             valid_names = {name for name, _ in children}
