@@ -184,7 +184,9 @@ class CognitiveAnnotator:
     def _call_llm(self, user_prompt: str) -> str:
         for attempt in range(3):
             try:
-                resp = self._client.chat.completions.create(
+                from voicemem.utils.common.openai_compat import chat_complete, message_text
+                resp = chat_complete(
+                    self._client,
                     model=self._model,
                     messages=[
                         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -194,7 +196,7 @@ class CognitiveAnnotator:
                     response_format={"type": "json_object"},
                     max_tokens=2048,
                 )
-                return (resp.choices[0].message.content or "").strip()
+                return message_text(resp)
             except Exception as e:
                 if attempt == 2:
                     logger.warning("CognitiveAnnotator LLM 失败: %s", e)

@@ -1,0 +1,34 @@
+{
+  "mode": "multi_modal",
+  "embedding": {"provider": "local"},
+  "slots": {"provider": "local"},
+  "llm": {
+    "provider": "openai",
+    "config": {
+      "model": "qwen3.8-27b",
+      "api_key": "EMPTY",
+      "base_url": "http://127.0.0.1:8000/v1"
+    }
+  },
+  "reply": {
+    "llm": {
+      "provider": "openai",
+      "config": {
+        "model": "qwen3.8-27b",
+        "api_key": "EMPTY",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "system": "You are this user's long-time voice assistant. Be brief, restrained, and spoken — not written. Reply in English.\nMemories come in two kinds:\n- MEMORY CONTEXT facts: you can mention them as things you already know, not as records.\n- HOW TO SPEAK: only changes your tone and what to avoid. Never say that text out loud.\nDo not recap what they just said. Do not start with \"I remember you said\". Do not read lists.\nWhen they are vague, pick a concrete fact from MEMORY CONTEXT if one exists. Never invent details that are not in memory. If memory is empty, say you do not know and ask. Prefer one or two short spoken sentences."
+      }
+    },
+    "tts": {
+      "provider": "openai",
+      "config": {
+        "model": "kokoro",
+        "voice": "af_bella",
+        "response_format": "wav",
+        "api_key": "EMPTY",
+        "base_url": "http://127.0.0.1:8000/v1"
+      }
+    }
+  }
+}

@@ -103,8 +103,10 @@ class OpenAIRightChannelRelevanceFilter:
             f"Current VAD: valence={current_vad.valence:.2f}, arousal={current_vad.arousal:.2f}\n\n"
             f"Historical anomaly attributions:\n{_format_candidates(candidates)}"
         )
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
+        from voicemem.utils.common.openai_compat import chat_complete, message_text
+        client = OpenAI(api_key=api_key, base_url=os.environ.get("OPENAI_BASE_URL") or None)
+        resp = chat_complete(
+            client,
             model=self._resolved_model(),
             messages=[
                 {"role": "system", "content": system},
@@ -113,7 +115,7 @@ class OpenAIRightChannelRelevanceFilter:
             response_format={"type": "json_object"},
             temperature=self._temperature,
         )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = message_text(resp)
         data = json.loads(raw)
         ids = data.get("relevant_turn_ids") or []
         if not isinstance(ids, list):

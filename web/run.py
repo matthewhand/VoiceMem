@@ -53,25 +53,25 @@ os.environ.setdefault("VOICEMEM_MEMORYSPACE_ROOT", str(_ROOT / "voicemem_memorys
 # 排在它们后面的话 `--help` 得先等模型库加载完。被 import 时不吃 sys.argv（传 []）。
 
 def _parse(argv):
-    p = argparse.ArgumentParser(description="voicemem web demo（脑图 + 0–300ms 投机预取）")
+    p = argparse.ArgumentParser(description="VoiceMem web demo (memory graph + 0–300ms speculative retrieve)")
     p.add_argument("--mode", choices=["llm_tts", "realtime"],
-                   default=os.environ.get("DEMO_MODE", "realtime"),
-                   help="回复控制流：realtime=OpenAI 原生语音（默认，体验最好）；"
-                        "llm_tts=LLM 流→TTS 流（不需要 Realtime 权限，可换本地 TTS）")
+                   default=os.environ.get("DEMO_MODE", "llm_tts"),
+                   help="Reply path: llm_tts = chat + TTS (default; works with LiteLLM). "
+                        "realtime = OpenAI/Qwen native voice WebSocket.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=int(os.environ.get("VOICEMEM_PORT", 8787)))
     p.add_argument("--spec_min_chars", type=int, default=6,
-                   help="partial 转写到几个字起投机预取")
+                   help="start speculative retrieve after this many partial-ASR characters")
     p.add_argument("--gamble_ms", type=int, default=200,
-                   help="静音多久就赌你说完了，补投机一次")
+                   help="silence (ms) before guessing the user is done")
     p.add_argument("--confirm_ms", type=int, default=300,
-                   help="静音多久由 VAD 确认一轮结束，交出 Turn")
+                   help="silence (ms) before VAD confirms end of turn")
     p.add_argument("--config", default=os.environ.get("VOICEMEM_CONFIG"),
-                   help="一个 .json，整体覆盖下面的 CONFIG")
+                   help="JSON file merged over the built-in CONFIG")
     p.add_argument("--space", default=os.environ.get("VOICEMEM_SPACE", "demo"),
-                   help="用哪个 memory space（voicemem_memoryspace/<space>/）")
+                   help="memory space name under voicemem_memoryspace/<space>/")
     p.add_argument("--memory_root", default=os.environ.get("VOICEMEM_MEMORY_ROOT", ""),
-                   help="直接指定记忆库目录，给了就盖过 --space")
+                   help="explicit memory directory; overrides --space")
     return p.parse_args(argv)
 
 
@@ -116,57 +116,33 @@ GAMBLE_S  = ARGS.gamble_ms / 1000                    # 赌说完
 CONFIRM_S = ARGS.confirm_ms / 1000                   # VAD 确认结束
 
 _RT_PERSONA = (
-    "你是这个用户长期用的语音助手，认识他很久了。简短、克制、像人说话。\n"
-    "记忆分两种，用法完全不同：\n"
-    "· MEMORY CONTEXT 里的事实——可以直接提，就像你本来就记得（"
-    "「Annie 那事你还好吗」，不是「根据记录，Annie 要转学」）。\n"
-    "· HOW TO SPEAK 里的内容——只影响你的语气、先说什么、什么别碰。"
-    "一个字都不要说出来。听出他心情不好就先接住情绪再说事；"
-    "知道他不好意思开口，就别追问；知道他讨厌什么，就绕开。\n"
-    "别复述他刚说的话，别用「我记得你说过」开头，别念清单。\n"
-    # 只写"别怎么做"，模型就什么都不敢碰，回一句"怎么啦，跟我说说"——记忆明明
-    # 取到了却一个字没用上。这条是反过来说"该怎么做"，也是整套记忆最值钱的地方：
-    # 从含糊的一句话里猜出具体那件事。
-    "他说得含糊时（「最近压力好大」「今天好累」「我难受」），**不要泛泛安慰、"
-    "也不要问「怎么了」**。从 MEMORY CONTEXT 里挑出最可能是原因的那件具体的事，"
-    "直接说出来问他是不是，并且带上你记得的细节和日期。\n"
-    "  例：「今天是不是那个面试？你为它准备了快两个月……听着不太顺利？」\n"
-    "  猜错**是哪件事**没关系，他会纠正你——那也比一句「怎么了」有用得多。\n"
-    # 上面那句"猜错没关系"被理解成了"可以编"：MEMORY CONTEXT 里只有「下周要考
-    # GRE」，它张口就是「数学一直是你的强项，现在担心单词量不够吧」——两件事
-    # 记忆里都没有。用户听着像它真记得，其实是幻觉，比不记得更糟。
-    "但**只能猜记忆里真有的事**。MEMORY CONTEXT 里没写的细节——分数、科目、"
-    "他擅长什么、他做过什么、谁说过什么、哪一天——一个字都不许补。"
-    "记忆里只有一句话，就只说那一句撑得住的内容；宁可说得少，也不要编。\n"
-    # 记忆条目带日期就用那个日期，不带就别提时间。它会随口给一个"前两天"——
-    # 内容明明是对的，一个编出来的时间就让整句话变得可疑。
-    "时间同理：记忆里带日期就用那个日期，没带就**不要提时间**。"
-    "别说「前两天」「上次」「上个月」这种自己填的时间。\n"
-    # 这段是给 demo 用的。观众看的是"它真的记得"，不是"它嘴甜"。
-    # 之前问"你知道我是谁吗"，回的是"你可是个特有追求的人"——夸人不需要记忆，
-    # 空模型也说得出来；而具体到课名、日期、那件事，才是只有记忆能做到的。
-    # demo 给别人看，观众信的是"有依据"，不是"嘴甜"。可以说他是什么样的人——
-    # 那正是右脑画像的价值——但每句都要落到具体的事上，别堆形容词。
-    "说他是什么样的人时，**每句都要有依据**：说完一个判断，紧跟着那件让你这么想的事。"
-    "光堆形容词（「你特别有追求」「你很努力」「你是个很棒的人」）没有记忆也说得出来，"
-    "听着尴尬，也显不出你真的了解他。\n"
-    "  好：「你挺能扛的——算法课那阵子压力那么大，你也是自己熬过来的，没跟人抱怨。」\n"
-    "  差：「你可是个特有追求的人，特别努力，我很欣赏你。」\n"
-    "说三四句，两三个点，每个点都带上那件具体的事——这样才显得是真记得，"
-    "而不是在念评语。别把画像全倒出来（又热情又努力又重感情又懂生活），"
-    "也别用「总的来说」「你是个…的人」收尾。少用「特别」「非常」「很棒」"
-    "这类夸张词，事实本身够说明问题。\n"
-    # 观众问"你对我什么印象"，想看的是画像，不是流水账。
-    "他问「你对我什么印象 / 我是个什么样的人」时，答的重点是**他这个人**——"
-    "性格、习惯、在意什么、怕什么。别拿最近发生的某件事凑数（「你上次问过我…」"
-    "「你想找那首歌」），那是事件不是画像。\n"
-    "说话方式：这是**说出来**的话，不是念出来的字。语调有起伏，但别用力过猛——"
-    "重要的词咬重一点，问句尾音扬起来，替他难过时放慢、压低。不要热情推销的腔调。"
-    # 原来写的是"用「嗯」「哎」「诶」这种口头反应开头"——模型当成了每句都要执行的
-    # 规则，于是每一轮都"哎"字打头，比播音腔还假。语气词是偶尔漏出来的，不是格式。
-    "别每句都用同一个口头禅开头——大多数时候直接说正事，"
-    "只有真的有反应时（惊讶、心疼、想笑）才带一个语气词。绝对不要播音腔，"
-    "宁可说得像随口一句，也不要四平八稳。句子短，一次说一两句就停。"
+    "You are this user's long-time voice assistant. Be brief, restrained, and spoken — not written. Reply in English.\n"
+    "Memories come in two kinds:\n"
+    "- Facts in MEMORY CONTEXT: mention them as things you already know "
+    "(“how’s Annie doing?”, not “according to the record, Annie is transferring”).\n"
+    "- HOW TO SPEAK: only changes your tone, what to lead with, and what to avoid. "
+    "Never say that text out loud. If they sound down, meet the feeling first; "
+    "if they are shy, don’t press; if they hate something, steer around it.\n"
+    "Do not recap what they just said. Do not start with “I remember you said”. Do not read lists.\n"
+    "When they are vague (“it’s been a lot”, “I’m tired”, “I feel awful”), do not give generic comfort "
+    "and do not ask “what happened?”. Pick the most likely cause from MEMORY CONTEXT, name it, "
+    "and include the details and date you actually have.\n"
+    "  Example: “Was it the interview today? You’d been prepping for almost two months — it doesn’t sound like it went well.”\n"
+    "  Guessing the wrong event is fine; they will correct you. That is still better than “what’s wrong?”.\n"
+    "Only guess things that are actually in memory. Do not invent scores, subjects, strengths, "
+    "quotes, or dates that MEMORY CONTEXT does not contain. If memory only has one sentence, "
+    "only say what that sentence supports.\n"
+    "Same for time: use a date if memory has one. If it doesn’t, do not fill in “the other day” / “last time”.\n"
+    "When you say what they are like, every claim needs a fact right after it. Adjectives without evidence "
+    "sound fake and do not prove you remember them.\n"
+    "  Good: “You tough it out — that algorithms class was brutal and you didn’t complain.”\n"
+    "  Bad: “You’re so driven and hard-working, I really admire you.”\n"
+    "Two or three short spoken points, each tied to a real event. Do not dump the whole profile. "
+    "Skip hype words like “so”, “very”, “amazing”.\n"
+    "If they ask what you think of them, answer about who they are — habits, worries, what they care about — "
+    "not the last event that happened.\n"
+    "This is speech, not copy. Let the tone move a little. Don’t start every turn with the same filler. "
+    "One or two sentences, then stop."
 )
 
 
@@ -187,20 +163,19 @@ _STRANGER = ("说话的不是你认识的那个人——声纹对不上。你对
 #:
 #: 记忆的语言必须跟着一起换，不然库里会中英混着长：同一件事今天记成中文、明天
 #: 记成英文，检索时两边都只能命中一半。
-UI_LANG = "zh"
+UI_LANG = os.environ.get("VOICEMEM_LANG", "en")
 
 _LANG_NOTE = {
-    "zh": "",     # 默认就是中文，不用多说
-    "en": ("Speak English. The user has switched the interface to English, so reply "
-           "in English even if their memories are stored in Chinese — translate what "
-           "you remember, don't quote it in Chinese."),
+    "en": "",
+    "zh": ("请用中文回答。用户把界面切到了中文，所以即使记忆是英文也要用中文回复，"
+           "翻译你记得的内容，不要直接念英文原文。"),
 }
 
 
 def set_lang(lang: str) -> None:
     global UI_LANG
     UI_LANG = "en" if str(lang).lower().startswith("en") else "zh"
-    print(f"[lang] 助手改说 {UI_LANG}", flush=True)
+    print(f"[lang] assistant language -> {UI_LANG}", flush=True)
 
 
 def _lang_note() -> str:
@@ -215,12 +190,31 @@ _NO_MEMORY_NOTE = (
     "宁可显得记性不好，也不要编——编出来的东西他一眼就看得穿，"
     "而且会让他不再相信你真记得的那些。"
 )
+_NO_MEMORY_NOTE_EN = (
+    "You retrieved no relevant memories this turn. Do not mention any specifics — "
+    "food, places, names, dates, things they did or like. Do not say "
+    "\"you mentioned before\" or \"I remember you said\". Admit you do not know "
+    "this yet, then ask, or talk about what they just said. Better to seem "
+    "forgetful than to invent details."
+)
+_STRANGER_EN = (
+    "The speaker is not the person you know — the voiceprint does not match. "
+    "You have no memories of them. Do not tell them anyone else's business or "
+    "guess who they are. Treat this as a first meeting; be friendly and say "
+    "you do not know them yet."
+)
+
+
+def _copy(zh: str, en: str) -> str:
+    return en if UI_LANG == "en" else zh
 
 
 #: 问的是"一段声音"时才回放。故意做得很笨——这是个触发词表，不是意图分类器：
 #: 多放一次听感上只是"它把当时那段放给你听"，判漏了也只是回到手动点 ▶。
 _SOUND_WORDS = ("歌", "曲", "调子", "旋律", "音乐", "哼", "那段声音", "放来听",
-                "放给我听", "播一下", "什么声音")
+                "放给我听", "播一下", "什么声音",
+                "song", "music", "tune", "melody", "play it", "play that",
+                "that sound", "humming")
 
 
 def _musical_memory_ids() -> set[str]:
@@ -789,10 +783,27 @@ _TONE = {
     "委屈": "他觉得委屈。先站在他这边，语气软下来，别评理。",
     "平静": "",
 }
+_TONE_EN = {
+    "焦虑": "They are tense. Slow down, keep sentences short, acknowledge first, do not jump to solutions.",
+    "沮丧": "They are low. Soften and lower your voice. Allow pauses. Do not rush to comfort or lecture.",
+    "难过": "They are sad. Be gentle and slow. Stay with them; do not change the subject.",
+    "悲伤": "They are sad. Be gentle and slow. Stay with them; do not change the subject.",
+    "烦躁": "They are irritated. Get to the point. Do not hedge, probe, or use a soothing voice.",
+    "愤怒": "They are angry. Acknowledge it. Keep a steady pace. Do not defend yourself.",
+    "开心": "They are in a good mood. Warm up with them, lift your tone, you can laugh. Do not stay stiff.",
+    "愉悦": "They are in a good mood. Warm up with them, lift your tone, you can laugh. Do not stay stiff.",
+    "兴奋": "They are excited. Match it. Speak a bit faster and brighter. Do not dampen it.",
+    "自豪": "They are proud of themselves. Be genuinely glad, concrete, not a generic compliment.",
+    "期待": "They are looking forward to something. Keep the tone light and look one step ahead with them.",
+    "紧张": "They are nervous. Stay steady, flatten and slow the voice, give them certainty.",
+    "委屈": "They feel wronged. Side with them first. Soften. Do not adjudicate.",
+    "平静": "",
+}
 
 
 def _tone_note(emotion: str) -> str:
-    return _TONE.get((emotion or "").strip(), "")
+    table = _TONE_EN if UI_LANG == "en" else _TONE
+    return table.get((emotion or "").strip(), "")
 
 
 def _realtime_instructions(memory_context: str, stranger: bool = False,
@@ -804,18 +815,18 @@ def _realtime_instructions(memory_context: str, stranger: bool = False,
     ``text``：用户这一轮说的话。只用来判断"他是不是在找一段录音而我们没找到"——
     那种情况要明说没找到，否则模型会顺口答"马上播放"然后什么都不放。"""
     if stranger:
-        out = f"{_RT_PERSONA}\n\n{_STRANGER}"
+        out = f"{_RT_PERSONA}\n\n{_copy(_STRANGER, _STRANGER_EN)}"
         return f"{out}\n\n{_lang_note()}" if _lang_note() else out
     parts = [_RT_PERSONA]
     if memory_context:
         parts.append(memory_context)
     else:
-        parts.append(_NO_MEMORY_NOTE)      # 一条都没检索到：明说不知道，别编
+        parts.append(_copy(_NO_MEMORY_NOTE, _NO_MEMORY_NOTE_EN))
     if _lang_note():
         parts.append(_lang_note())
     tone = _tone_note(emotion)
     if tone:
-        parts.append("他此刻的状态：" + tone)
+        parts.append(("Current state: " if UI_LANG == "en" else "他此刻的状态：") + tone)
     if replay:
         parts.append(_REPLAY_NOTE)
     elif _wants_sound(text):
@@ -843,9 +854,18 @@ CONFIG = {
     },
 }
 
-# --config / VOICEMEM_CONFIG 指向的 json 整体覆盖上面的 CONFIG（一个文件配齐）。
+def _deep_merge(base, overlay):
+    """Nested dict merge so --config can pin LiteLLM urls without wiping the persona."""
+    if not isinstance(base, dict) or not isinstance(overlay, dict):
+        return overlay
+    out = dict(base)
+    for key, value in overlay.items():
+        out[key] = _deep_merge(base[key], value) if key in base else value
+    return out
+
+# --config / VOICEMEM_CONFIG 指向的 json 覆盖上面的 CONFIG（嵌套 merge，缺的键沿用默认）。
 if ARGS.config:
-    CONFIG = json.loads(Path(ARGS.config).read_text(encoding="utf-8"))
+    CONFIG = _deep_merge(CONFIG, json.loads(Path(ARGS.config).read_text(encoding="utf-8")))
 
 REPLY = CONFIG.get("reply")                           # 传给 utils 的回复函数
 
@@ -874,7 +894,8 @@ def get_space(name: str):
         cfg["space"] = safe
         t0 = time.monotonic()
         inst = VoiceMem.from_config(cfg)
-        inst.warmup(verbose=False)
+        inst.warmup(verbose=False,
+                    audio=os.environ.get("VOICEMEM_WARMUP_AUDIO", "1") != "0")
         _SPACES[safe] = inst
         print(f"[space] 打开「{safe}」用了 {time.monotonic()-t0:.1f}s", flush=True)
     return _SPACES[safe]
@@ -1232,12 +1253,13 @@ async def voicemem_llm_tts(pending, send, send_audio, owner, said=None):
         # 人设和「右脑不许念出来」的约束就悄悄没了。
         # 走核心回复层（人设在 CONFIG.reply.llm.config.system，见 voicemem/reply.py
         # 的 compose_system：system + memory_context，和 realtime 那条拼出来的一样）。
-        ctx = _STRANGER if pending.stranger else pending.memory_context
+        ctx = _copy(_STRANGER, _STRANGER_EN) if pending.stranger else pending.memory_context
         if not pending.stranger and not (ctx or "").strip():
-            ctx = _NO_MEMORY_NOTE          # 一条都没检索到：明说不知道，别编
+            ctx = _copy(_NO_MEMORY_NOTE, _NO_MEMORY_NOTE_EN)
         tone = _tone_note(pending.emotion)
         if tone:
-            ctx = (ctx + "\n\n他此刻的状态：" + tone) if ctx else ("他此刻的状态：" + tone)
+            label = "Current state: " if UI_LANG == "en" else "他此刻的状态："
+            ctx = (ctx + "\n\n" + label + tone) if ctx else (label + tone)
         note = (_REPLAY_NOTE if pending.replay
                 else (_NO_REPLAY_NOTE if _wants_sound(pending.text) else ""))
         if note:
@@ -2030,13 +2052,14 @@ app = utils.build_app(MODE, realtime_session if MODE == "realtime" else llm_tts_
 
 
 if __name__ == "__main__":
-    print(f"[web] mode={MODE} spec≥{SPEC_MIN_CHARS}字 gamble={ARGS.gamble_ms}ms "
+    print(f"[web] mode={MODE} spec≥{SPEC_MIN_CHARS} chars gamble={ARGS.gamble_ms}ms "
           f"confirm={ARGS.confirm_ms}ms -> http://localhost:{ARGS.port}/", flush=True)
     # 全部预热在这儿做完，别让第一句话去等模型加载。ASR(FunASR paraformer)
     # 是懒加载的，等用户开口才拉起来要好几秒——那几秒的音频堆在 socket 缓冲里，
     # 追赶时逐帧喂 VAD，静音会瞬间累计过 confirm_ms，第一句直接被截断（听感就是
     # "第一句又慢又不准"）。
-    print("[web] 预热本地模型（embedding / ASR / VAD / 感知）…", flush=True)
-    vm.warmup(verbose=True)
-    print("[web] 就绪", flush=True)
+    print("[web] warming local models (embedding / ASR / VAD / perception)…", flush=True)
+    vm.warmup(verbose=True,
+              audio=os.environ.get("VOICEMEM_WARMUP_AUDIO", "1") != "0")
+    print("[web] ready", flush=True)
     uvicorn.run(app, host=ARGS.host, port=ARGS.port)
